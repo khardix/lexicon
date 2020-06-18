@@ -1,8 +1,16 @@
+# -*- coding: utf-8 -*-
 """Czech registrar Active24 – https://www.active24.cz/"""
 from __future__ import absolute_import
 from __future__ import unicode_literals
 
+import requests
+
 from . import base
+
+try:
+    from urllib.parse import urljoin
+except ImportError:
+    from urlparse import urljoin
 
 #: FQDN patters of the provider name servers
 NAMESERVER_DOMAINS = ["ns.active24.cz", "ns.active24.sk"]
@@ -11,14 +19,34 @@ NAMESERVER_DOMAINS = ["ns.active24.cz", "ns.active24.sk"]
 def provider_parser(subparser):
     """Add provider-specific CLI options."""
 
+    subparser.add_argument(
+        "--auth-token", help="Specify authentication token for the rest API.",
+    )
+    subparser.add_argument(
+        "--api-endpoint",
+        default="https://api.active24.com",
+        help="Specify the API endpoint to connect to.",
+    )
+
 
 class Provider(base.Provider):
     """Interface to the Active24 REST API."""
+
+    def __init__(self, config):
+        super(Provider, self).__init__(config)
+
+        self.api_endpoint = self._get_provider_option("api_endpoint")
+
+        self.session = requests.Session()
+        self.session.headers["Content-Type"] = "application/json"
 
     # ### Setup and helpers ###
 
     def _authenticate(self):
         """Authenticate any future requests to the API."""
+
+        token = self._get_provider_option("auth_token")
+        self.session.headers["Authorization"] = "Bearer {token}".format(token=token)
 
     def _request(self, action="GET", url="/", data=None, query_params=None):
         """Request data from the API.
@@ -37,7 +65,18 @@ class Provider(base.Provider):
             requests.ConnectionError: The API endpoint could not be reached.
         """
 
-        return {}
+        if data is None:
+            data = {}
+        if query_params is None:
+            query_params = {}
+
+        target_url = urljoin(self.api_endpoint, url, allow_fragments=False)
+
+        response = self.session.request(
+            action, target_url, params=query_params, json=data
+        )
+        response.raise_for_status()
+        return response.json()
 
     # ### CRUD methods ###
 
@@ -67,7 +106,15 @@ class Provider(base.Provider):
             list: Matching records in canonical format.
         """
 
-        return []
+        target_url = "/dns/{domain}/records/v1".format(domain=self.domain)
+
+        record_iter = self._get(target_url)
+        if rtype:
+            record_iter = filter(lambda r: r["type"] == rtype, record_iter)
+        # FIXME: Normalize
+        # FIXME: Filter by content
+
+        return list(record_iter)
 
     def _update_record(self, identifier, rtype=None, name=None, content=None):
         """Update (or create) a record.
