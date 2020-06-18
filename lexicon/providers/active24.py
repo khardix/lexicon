@@ -5,7 +5,7 @@ from __future__ import unicode_literals
 from . import base
 
 #: FQDN patters of the provider name servers
-NAMESERVER_DOMAINS = []
+NAMESERVER_DOMAINS = ["ns.active24.cz", "ns.active24.sk"]
 
 
 def provider_parser(subparser):
