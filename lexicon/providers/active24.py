@@ -15,6 +15,24 @@ except ImportError:
 #: FQDN patters of the provider name servers
 NAMESERVER_DOMAINS = ["ns.active24.cz", "ns.active24.sk"]
 
+#: Content name by record type
+_CONTENT_NAME_MAP = {
+    "A": "ip",
+    "AAAA": "ip",
+    "CAA": "caaValue",
+    "CNAME": "alias",
+    "MX": "mailserver",
+    "NS": "nameServer",
+    "SRV": "target",
+    "SSHFP": "text",
+    "TLSA": "hash",
+    "TXT": "text",
+}
+
+
+class UnsupportedRecordType(RuntimeError):
+    """The record type is not supported by the provider."""
+
 
 def provider_parser(subparser):
     """Add provider-specific CLI options."""
@@ -27,6 +45,34 @@ def provider_parser(subparser):
         default="https://api.active24.com",
         help="Specify the API endpoint to connect to.",
     )
+
+
+def normalize_record(provider_record):
+    """Convert from provider response to format expected by lexicon.
+
+    Returns:
+        dict: Normalized record.
+
+    Raises:
+        UnsupportedRecordType: The record type is not supported.
+    """
+
+    rtype = provider_record["type"].upper()
+    try:
+        content = _CONTENT_NAME_MAP[rtype]
+    except KeyError:
+        message = "{rtype} record is not supported".format(rtype=rtype)
+        raise UnsupportedRecordType(message)
+
+    normalized = {"type": rtype}
+    normalized["id"] = provider_record.pop("hashId")
+    normalized["name"] = provider_record.pop("name")
+    normalized["ttl"] = provider_record.pop("ttl")
+    normalized["content"] = provider_record.pop(content)
+    if provider_record:
+        normalized["options"] = {rtype.lower(): provider_record}
+
+    return normalized
 
 
 class Provider(base.Provider):
@@ -111,8 +157,9 @@ class Provider(base.Provider):
         record_iter = self._get(target_url)
         if rtype:
             record_iter = filter(lambda r: r["type"] == rtype, record_iter)
-        # FIXME: Normalize
-        # FIXME: Filter by content
+        record_iter = map(normalize_record, record_iter)
+        if content:
+            record_iter = filter(lambda r: r["content"] == content, record_iter)
 
         return list(record_iter)
 
