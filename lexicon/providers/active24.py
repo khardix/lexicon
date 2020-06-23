@@ -3,6 +3,9 @@
 from __future__ import absolute_import
 from __future__ import unicode_literals
 
+import logging
+from datetime import timedelta
+
 import requests
 
 from . import base
@@ -14,6 +17,9 @@ except ImportError:
 
 #: FQDN patters of the provider name servers
 NAMESERVER_DOMAINS = ["ns.active24.cz", "ns.active24.sk"]
+
+#: Default TTL if not specified by the user
+DEFAULT_TTL = timedelta(hours=1).seconds
 
 #: Content name by record type
 _CONTENT_NAME_MAP = {
@@ -28,6 +34,10 @@ _CONTENT_NAME_MAP = {
     "TLSA": "hash",
     "TXT": "text",
 }
+#: Set of record types which accept priority setting
+_PRIORITY_TYPE_SET = {"MX", "SRV"}
+
+_LOG = logging.getLogger(__name__)
 
 
 class UnsupportedRecordType(RuntimeError):
@@ -47,6 +57,27 @@ def provider_parser(subparser):
     )
 
 
+def get_content_name(record_type):
+    """Retrieve name of the content field for the respective record type.
+
+    Arguments:
+        record_type (str): The type of the record to query.
+
+    Returns:
+        str: Name of the content field.
+
+    Raises:
+        UnsupportedRecordType:
+            The record_type does not name a supported record type.
+    """
+
+    try:
+        return _CONTENT_NAME_MAP[record_type.upper()]
+    except KeyError:
+        message = "{rtype} record is not supported".format(rtype=record_type)
+        raise UnsupportedRecordType(message)
+
+
 def normalize_record(provider_record):
     """Convert from provider response to format expected by lexicon.
 
@@ -58,11 +89,7 @@ def normalize_record(provider_record):
     """
 
     rtype = provider_record["type"].upper()
-    try:
-        content = _CONTENT_NAME_MAP[rtype]
-    except KeyError:
-        message = "{rtype} record is not supported".format(rtype=rtype)
-        raise UnsupportedRecordType(message)
+    content = get_content_name(rtype)
 
     normalized = {"type": rtype}
     normalized["id"] = provider_record.pop("hashId")
@@ -122,7 +149,10 @@ class Provider(base.Provider):
             action, target_url, params=query_params, json=data
         )
         response.raise_for_status()
-        return response.json()
+        try:
+            return response.json()
+        except ValueError:  # No JSON content
+            return {}
 
     # ### CRUD methods ###
 
@@ -140,6 +170,21 @@ class Provider(base.Provider):
             True: Record was created (or already existed).
         """
 
+        target_url = "/dns/{domain}/{rtype}/v1".format(
+            domain=self.domain, rtype=rtype.lower(),
+        )
+
+        record = {
+            "name": name,
+            get_content_name(rtype): content,
+            "ttl": self._get_lexicon_option("ttl") or DEFAULT_TTL,
+        }
+        if rtype in _PRIORITY_TYPE_SET:
+            record["priority"] = self._get_lexicon_option("priority") or 0
+
+        self._post(target_url, data=record)
+        return True
+
     def _list_records(self, rtype=None, name=None, content=None):
         """List all records that match the arguments.
 
@@ -154,7 +199,7 @@ class Provider(base.Provider):
 
         target_url = "/dns/{domain}/records/v1".format(domain=self.domain)
 
-        record_iter = self._get(target_url)
+        record_iter = iter(self._get(target_url))
         if rtype:
             record_iter = filter(lambda r: r["type"] == rtype, record_iter)
         record_iter = map(normalize_record, record_iter)
@@ -176,6 +221,35 @@ class Provider(base.Provider):
             True: Record was sucessfully updated.
         """
 
+        if not all((identifier, rtype, name, content)):
+            try:
+                (matching,) = self._list_records(rtype, name)
+            except ValueError:
+                raise Exception("Cannot find exact match, won't update")
+
+        if rtype is None:
+            rtype = matching["type"]
+
+        target_url = "/dns/{domain}/{rtype}/v1".format(
+            domain=self.domain, rtype=rtype.lower()
+        )
+
+        record = {
+            "hashId": identifier or matching["id"],
+            "name": name or matching["name"],
+            get_content_name(rtype): content or matching["content"],
+            "ttl": self._get_lexicon_option("ttl") or matching["ttl"],
+        }
+        if rtype in _PRIORITY_TYPE_SET:
+            record["priority"] = (
+                self._get_lexicon_option("priority")
+                or matching["options"][rtype.lower()]["priority"]
+            )
+
+        _LOG.debug("Putting record: %s", record)
+        self._put(target_url, data=record)
+        return True
+
     def _delete_record(self, identifier, rtype=None, name=None, content=None):
         """Remove existing record.
 
@@ -190,3 +264,19 @@ class Provider(base.Provider):
         Returns:
             True: Record was sucessfully updated.
         """
+
+        if not identifier:
+            try:
+                (matching,) = self._list_records(rtype, name)
+            except ValueError:
+                _LOG.warning("Cannot find exact match, won't delete")
+                return False
+            else:
+                identifier = matching["id"]
+
+        target_url = "/dns/{domain}/{hashId}/v1".format(
+            domain=self.domain, hashId=identifier
+        )
+
+        self._delete(target_url)
+        return True
