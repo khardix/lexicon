@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Czech registrar Active24 – https://www.active24.cz/"""
 from __future__ import absolute_import
+from __future__ import print_function
 from __future__ import unicode_literals
 
 import logging
@@ -18,6 +19,8 @@ except ImportError:
 #: FQDN patters of the provider name servers
 NAMESERVER_DOMAINS = ["ns.active24.cz", "ns.active24.sk"]
 
+#: Default API endpoint if not specified
+DEFAULT_API_ENDPOINT = "https://api.active24.com"
 #: Default TTL if not specified by the user
 DEFAULT_TTL = timedelta(hours=1).seconds
 
@@ -44,16 +47,15 @@ class UnsupportedRecordType(RuntimeError):
     """The record type is not supported by the provider."""
 
 
+class UnownedDomain(Exception):
+    """The domain is not owned by the authorized user."""
+
+
 def provider_parser(subparser):
     """Add provider-specific CLI options."""
 
     subparser.add_argument(
         "--auth-token", help="Specify authentication token for the rest API.",
-    )
-    subparser.add_argument(
-        "--api-endpoint",
-        default="https://api.active24.com",
-        help="Specify the API endpoint to connect to.",
     )
 
 
@@ -108,18 +110,129 @@ class Provider(base.Provider):
     def __init__(self, config):
         super(Provider, self).__init__(config)
 
-        self.api_endpoint = self._get_provider_option("api_endpoint")
+        #: Provider identifier of authorized domain
+        self.domain_id = None
 
+        #: Endpoint for all API calls
+        self.api_endpoint = DEFAULT_API_ENDPOINT
+
+        #: Authorized requests session
         self.session = requests.Session()
         self.session.headers["Content-Type"] = "application/json"
+        self.session.headers["Authorization"] = "Bearer {token}".format(
+            token=self._get_provider_option("auth_token")
+        )
 
-    # ### Setup and helpers ###
+    # ### Helpers ###
 
-    def _authenticate(self):
-        """Authenticate any future requests to the API."""
+    def __assemble_lexicon_record(self, identifier, rtype, name, content):
+        """Assemble lexicon record dictionary from constituent parts."""
 
-        token = self._get_provider_option("auth_token")
-        self.session.headers["Authorization"] = "Bearer {token}".format(token=token)
+        record = {
+            "type": rtype.upper(),
+            "name": name,
+            "content": content,
+            "ttl": self._get_lexicon_option("ttl") or DEFAULT_TTL,
+        }
+        if identifier:
+            record["id"] = identifier
+
+        return record
+
+    def __normalize_for_lexicon(self, provider_record):
+        """Convert provider record dictionary to lexicon record dictionary.
+
+        Arguments:
+            provider_record (dict): DNS record dictionary in Active24 format.
+
+        Returns:
+            dict: DNS record dictionary in format expected by lexicon.
+
+        Raises:
+            UnsupportedRecordType: The record type is not supported by the provider.
+        """
+
+        def make_fqdn(name):
+            """Active24 always returns the record name without the domain."""
+
+            return ".".join((name, self.domain, ""))
+
+        def extract_content(provider_record, rtype):
+            """Active24 names record contents differently for different types."""
+
+            try:
+                name = _CONTENT_NAME_MAP[rtype.upper()]
+            except KeyError:
+                message = "{rtype} record is not supported".format(rtype=rtype)
+                raise UnsupportedRecordType(message)
+
+            return provider_record.pop(name)
+
+        rtype = provider_record.pop("type").upper()
+        normalized = {
+            "id": provider_record.pop("hashId", None),
+            "type": rtype,
+            "name": make_fqdn(provider_record.pop("name")),
+            "ttl": provider_record.pop("ttl"),
+            "content": extract_content(provider_record, rtype),
+        }
+        if provider_record:  # there is something left
+            normalized["options"] = {rtype.lower(): provider_record}
+
+        return normalized
+
+    def __normalize_for_provider(self, lexicon_record):
+        """Convert lexicon_record dictionary to provider record dictionary.
+
+        Arguments:
+            lexicon_record (dict): DNS record in lexicon format.
+
+        Returns:
+            (str, dict):
+                1. Record type
+                2. DNS record dictionary in format expected by the provider.
+
+        Raises:
+            UnsupportedRecordType: The record type is not supported by the provider.
+        """
+
+        def make_name_prefix(fqdn):
+            """Active24 accepts only name prefixes
+            and attaches the domain implicitly.
+            """
+
+            prefix = fqdn.rstrip(
+                "."
+            )  # Really *fully* qualified name has a dot at the end
+
+            if prefix.endswith(self.domain):
+                end = len(prefix) - len(self.domain)
+                prefix = prefix[:end].rstrip(".")
+
+            return prefix
+
+        def query_content_name(rtype):
+            """Active24 names different record type contents differently."""
+
+            try:
+                return _CONTENT_NAME_MAP[rtype.upper()]
+            except KeyError:
+                message = "{rtype} record is not supported".format(rtype=rtype)
+                raise UnsupportedRecordType(message)
+
+        rtype = lexicon_record["type"]
+        normalized = {
+            "name": make_name_prefix(lexicon_record["name"]),
+            query_content_name(rtype): lexicon_record["content"],
+            "ttl": lexicon_record["ttl"],
+        }
+
+        if lexicon_record.get("id"):
+            normalized["hashId"] = lexicon_record["id"]
+        if lexicon_record.get("options"):
+            normalized.update(lexicon_record["options"][rtype.lower()])
+
+        return rtype, normalized
 
     def _request(self, action="GET", url="/", data=None, query_params=None):
         """Request data from the API.
@@ -154,6 +267,22 @@ class Provider(base.Provider):
         except ValueError:  # No JSON content
             return {}
 
+    # ### Setup ###
+
+    def _authenticate(self):
+        """Verify ownership of the modified domain."""
+
+        target_url = "/domains/v1"
+
+        owned_domains = {domain["name"] for domain in self._get(target_url)}
+        if self.domain in owned_domains:
+            # Active24 uses domain name as identifier
+            self.domain_id = self.domain
+        else:
+            raise UnownedDomain(
+                "{domain} is not in list of owned domains".format(domain=self.domain)
+            )
+
     # ### CRUD methods ###
 
     def _create_record(self, rtype, name, content):
@@ -170,15 +299,17 @@ class Provider(base.Provider):
             True: Record was created (or already existed).
         """
 
+        # The API reject duplicate entries with code 400, have to check beforehand
+        if self._list_records(rtype, name, content):
+            return True
+
         target_url = "/dns/{domain}/{rtype}/v1".format(
             domain=self.domain, rtype=rtype.lower(),
         )
 
-        record = {
-            "name": name,
-            get_content_name(rtype): content,
-            "ttl": self._get_lexicon_option("ttl") or DEFAULT_TTL,
-        }
+        record = self.__normalize_for_provider(
+            self.__assemble_lexicon_record(None, rtype, name, content)
+        )
         if rtype in _PRIORITY_TYPE_SET:
             record["priority"] = self._get_lexicon_option("priority") or 0
 
@@ -199,12 +330,16 @@ class Provider(base.Provider):
 
         target_url = "/dns/{domain}/records/v1".format(domain=self.domain)
 
+        match_type = (lambda r: r["type"] == rtype) if rtype else None
+        match_name = (lambda r: r["name"] == name) if name else None
+        match_content = (lambda r: r["content"] == content) if content else None
+
         record_iter = iter(self._get(target_url))
-        if rtype:
-            record_iter = filter(lambda r: r["type"] == rtype, record_iter)
-        record_iter = map(normalize_record, record_iter)
-        if content:
-            record_iter = filter(lambda r: r["content"] == content, record_iter)
+
+        record_iter = map(self.__normalize_for_lexicon, record_iter)
+        record_iter = filter(match_type, record_iter)
+        record_iter = filter(match_name, record_iter)
+        record_iter = filter(match_content, record_iter)
 
         return list(record_iter)
 
@@ -223,29 +358,41 @@ class Provider(base.Provider):
 
         if not all((identifier, rtype, name, content)):
             try:
-                (matching,) = self._list_records(rtype, name)
+                (lexicon_record,) = self._list_records(rtype, name)
             except ValueError:
                 raise Exception("Cannot find exact match, won't update")
+        else:
+            lexicon_record = self.__assemble_lexicon_record(
+                identifier, rtype, name, content
+            )
 
-        if rtype is None:
-            rtype = matching["type"]
+        if rtype:
+            lexicon_record["type"] = rtype
+        else:
+            rtype = lexicon_record["type"]
+
+        if identifier:
+            lexicon_record["id"] = identifier
+        if name:
+            lexicon_record["name"] = name
+        if content:
+            lexicon_record["content"] = content
+
+        if rtype in _PRIORITY_TYPE_SET:
+            priority = self._get_lexicon_option("priority")
+        else:
+            priority = None
+
+        if priority:
+            options = lexicon_record.setdefault("options", {})
+            record_options = options.setdefault(rtype.lower(), {})
+            record_options["priority"] = priority
 
         target_url = "/dns/{domain}/{rtype}/v1".format(
             domain=self.domain, rtype=rtype.lower()
         )
 
-        record = {
-            "hashId": identifier or matching["id"],
-            "name": name or matching["name"],
-            get_content_name(rtype): content or matching["content"],
-            "ttl": self._get_lexicon_option("ttl") or matching["ttl"],
-        }
-        if rtype in _PRIORITY_TYPE_SET:
-            record["priority"] = (
-                self._get_lexicon_option("priority")
-                or matching["options"][rtype.lower()]["priority"]
-            )
-
+        record = self.__normalize_for_provider(lexicon_record)
         _LOG.debug("Putting record: %s", record)
         self._put(target_url, data=record)
         return True
